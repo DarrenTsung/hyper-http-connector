@@ -13,7 +13,6 @@ extern crate tokio_service;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
-use std::mem;
 use std::time::Duration;
 
 use futures::{Future, Poll, Async};
@@ -183,7 +182,7 @@ impl Future for HttpConnecting {
                         Async::NotReady => return Ok(Async::NotReady),
                         Async::Ready(a_results) => {
                             state = State::Connecting(ConnectingTcp {
-                                addrs: dns::IpAddrs::new(*port, a_results),
+                                addrs: dns::IpAddrs::from_a_results(*port, a_results),
                                 current: None,
                             })
                         }
