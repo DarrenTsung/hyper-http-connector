@@ -22,7 +22,6 @@ use futures_cpupool::{Builder as CpuPoolBuilder};
 use futures::{Future, Poll, Async};
 use futures::future::{Executor, ExecuteError};
 use futures::sync::oneshot;
-use hyper::client::Connect;
 use hyper::Uri;
 use tokio_core::net::{TcpStream, TcpStreamNew};
 use tokio_core::reactor::Handle;
@@ -299,8 +298,10 @@ impl Executor<oneshot::Execute<dns::Work>> for HttpConnectExecutor {
 
 #[cfg(test)]
 mod tests {
+    use super::HttpConnector;
+
+    use hyper::client::Connect;
     use std::io;
-    use super::{Connect, HttpConnector};
     use tokio_core::reactor::Core;
 
     #[test]
