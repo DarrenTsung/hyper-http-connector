@@ -4,33 +4,32 @@
 #[macro_use] extern crate log;
 #[macro_use] extern crate futures;
 
-extern crate futures_cpupool;
 extern crate hyper;
 extern crate tokio_core;
 extern crate tokio_service;
+extern crate trust_dns_resolver;
 
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
 use std::mem;
-use std::sync::Arc;
 use std::time::Duration;
 
-use futures_cpupool::{Builder as CpuPoolBuilder};
 use futures::{Future, Poll, Async};
-use futures::future::{Executor, ExecuteError};
-use futures::sync::oneshot;
 use hyper::Uri;
 use tokio_core::net::{TcpStream, TcpStreamNew};
 use tokio_core::reactor::Handle;
 use tokio_service::Service;
+
+use trust_dns_resolver::config::*;
+use trust_dns_resolver::lookup_ip::{LookupIpFuture};
+use trust_dns_resolver::ResolverFuture;
 
 mod dns;
 
 /// A connector for the `http` scheme.
 #[derive(Clone)]
 pub struct HttpConnector {
-    executor: HttpConnectExecutor,
     enforce_http: bool,
     handle: Handle,
     keep_alive_timeout: Option<Duration>,
@@ -38,26 +37,9 @@ pub struct HttpConnector {
 
 impl HttpConnector {
     /// Construct a new HttpConnector.
-    ///
-    /// Takes number of DNS worker threads.
     #[inline]
-    pub fn new(threads: usize, handle: &Handle) -> HttpConnector {
-        let pool = CpuPoolBuilder::new()
-            .name_prefix("hyper-dns")
-            .pool_size(threads)
-            .create();
-        HttpConnector::new_with_executor(pool, handle)
-    }
-
-    /// Construct a new HttpConnector.
-    ///
-    /// Takes an executor to run blocking tasks on.
-    #[inline]
-    pub fn new_with_executor<E: 'static>(executor: E, handle: &Handle) -> HttpConnector
-        where E: Executor<HttpConnectorBlockingTask>
-    {
+    pub fn new(handle: &Handle) -> HttpConnector {
         HttpConnector {
-            executor: HttpConnectExecutor(Arc::new(executor)),
             enforce_http: true,
             handle: handle.clone(),
             keep_alive_timeout: None,
@@ -121,7 +103,7 @@ impl Service for HttpConnector {
         };
 
         HttpConnecting {
-            state: State::Lazy(self.executor.clone(), host.into(), port),
+            state: State::Lazy(host.into(), port),
             handle: self.handle.clone(),
             keep_alive_timeout: self.keep_alive_timeout,
         }
@@ -169,8 +151,8 @@ pub struct HttpConnecting {
 }
 
 enum State {
-    Lazy(HttpConnectExecutor, String, u16),
-    Resolving(oneshot::SpawnHandle<dns::IpAddrs, io::Error>),
+    Lazy(String, u16),
+    Resolving(LookupIpFuture, u16),
     Connecting(ConnectingTcp),
     Error(Option<io::Error>),
 }
@@ -183,7 +165,7 @@ impl Future for HttpConnecting {
         loop {
             let state;
             match self.state {
-                State::Lazy(ref executor, ref mut host, port) => {
+                State::Lazy(ref mut host, port) => {
                     // If the host is already an IP addr (v4 or v6),
                     // skip resolving the dns and start connecting right away.
                     if let Some(addrs) = dns::IpAddrs::try_parse(host, port) {
@@ -193,16 +175,22 @@ impl Future for HttpConnecting {
                         })
                     } else {
                         let host = mem::replace(host, String::new());
-                        let work = dns::Work::new(host, port);
-                        state = State::Resolving(oneshot::spawn(work, executor));
+                        let resolver = ResolverFuture::new(
+                            ResolverConfig::default(),
+                            ResolverOpts::default(),
+                            &self.handle,
+                        );
+
+                        let work = resolver.lookup_ip(&host);
+                        state = State::Resolving(work, port);
                     }
                 },
-                State::Resolving(ref mut future) => {
+                State::Resolving(ref mut future, ref port) => {
                     match try!(future.poll()) {
                         Async::NotReady => return Ok(Async::NotReady),
-                        Async::Ready(addrs) => {
+                        Async::Ready(lookup_ip) => {
                             state = State::Connecting(ConnectingTcp {
-                                addrs: addrs,
+                                addrs: dns::IpAddrs::new(*port, lookup_ip),
                                 current: None,
                             })
                         }
@@ -264,36 +252,6 @@ impl ConnectingTcp {
     }
 }
 
-/// Blocking task to be executed on a thread pool.
-pub struct HttpConnectorBlockingTask {
-    work: oneshot::Execute<dns::Work>
-}
-
-impl fmt::Debug for HttpConnectorBlockingTask {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.pad("HttpConnectorBlockingTask")
-    }
-}
-
-impl Future for HttpConnectorBlockingTask {
-    type Item = ();
-    type Error = ();
-
-    fn poll(&mut self) -> Poll<(), ()> {
-        self.work.poll()
-    }
-}
-
-#[derive(Clone)]
-struct HttpConnectExecutor(Arc<Executor<HttpConnectorBlockingTask>>);
-
-impl Executor<oneshot::Execute<dns::Work>> for HttpConnectExecutor {
-    fn execute(&self, future: oneshot::Execute<dns::Work>) -> Result<(), ExecuteError<oneshot::Execute<dns::Work>>> {
-        self.0.execute(HttpConnectorBlockingTask { work: future })
-            .map_err(|err| ExecuteError::new(err.kind(), err.into_future().work))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::HttpConnector;
@@ -306,7 +264,7 @@ mod tests {
     fn test_errors_missing_authority() {
         let mut core = Core::new().unwrap();
         let url = "/foo/bar?baz".parse().unwrap();
-        let connector = HttpConnector::new(1, &core.handle());
+        let connector = HttpConnector::new(&core.handle());
 
         assert_eq!(core.run(connector.connect(url)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
@@ -315,7 +273,7 @@ mod tests {
     fn test_errors_enforce_http() {
         let mut core = Core::new().unwrap();
         let url = "https://example.domain/foo/bar?baz".parse().unwrap();
-        let connector = HttpConnector::new(1, &core.handle());
+        let connector = HttpConnector::new(&core.handle());
 
         assert_eq!(core.run(connector.connect(url)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
@@ -325,7 +283,7 @@ mod tests {
     fn test_errors_missing_scheme() {
         let mut core = Core::new().unwrap();
         let url = "example.domain".parse().unwrap();
-        let connector = HttpConnector::new(1, &core.handle());
+        let connector = HttpConnector::new(&core.handle());
 
         assert_eq!(core.run(connector.connect(url)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }

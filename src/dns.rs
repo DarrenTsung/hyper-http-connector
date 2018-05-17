@@ -1,40 +1,29 @@
-use std::io;
 use std::net::{
-    Ipv4Addr, Ipv6Addr,
-    SocketAddr, ToSocketAddrs,
+    IpAddr, Ipv4Addr, Ipv6Addr,
+    SocketAddr,
     SocketAddrV4, SocketAddrV6,
 };
 use std::vec;
 
-use ::futures::{Async, Future, Poll};
-
-pub struct Work {
-    host: String,
-    port: u16
-}
-
-impl Work {
-    pub fn new(host: String, port: u16) -> Work {
-        Work { host: host, port: port }
-    }
-}
-
-impl Future for Work {
-    type Item = IpAddrs;
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        debug!("resolving host={:?}, port={:?}", self.host, self.port);
-        (&*self.host, self.port).to_socket_addrs()
-            .map(|i| Async::Ready(IpAddrs { iter: i }))
-    }
-}
+use trust_dns_resolver::lookup_ip::{LookupIp};
 
 pub struct IpAddrs {
     iter: vec::IntoIter<SocketAddr>,
 }
 
 impl IpAddrs {
+    pub fn new(port: u16, lookup_ip: LookupIp) -> IpAddrs {
+        let ips = lookup_ip.iter().map(|ip| {
+            match ip {
+                IpAddr::V4(ip) => SocketAddr::V4(SocketAddrV4::new(ip, port)),
+                IpAddr::V6(ip) => SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)),
+            }
+        }).collect::<Vec<_>>();
+        IpAddrs {
+            iter: ips.into_iter(),
+        }
+    }
+
     pub fn try_parse(host: &str, port: u16) -> Option<IpAddrs> {
         if let Ok(addr) = host.parse::<Ipv4Addr>() {
             let addr = SocketAddrV4::new(addr, port);
