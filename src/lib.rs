@@ -28,11 +28,11 @@ use c_ares::AResults;
 mod dns;
 
 /// A connector for the `http` scheme.
-#[derive(Clone)]
 pub struct HttpConnector {
     enforce_http: bool,
     handle: Handle,
     keep_alive_timeout: Option<Duration>,
+    resolver: FutureResolver,
 }
 
 impl HttpConnector {
@@ -43,6 +43,7 @@ impl HttpConnector {
             enforce_http: true,
             handle: handle.clone(),
             keep_alive_timeout: None,
+            resolver: FutureResolver::new().unwrap(),
         }
     }
 
@@ -102,8 +103,21 @@ impl Service for HttpConnector {
             },
         };
 
+        // If the host is already an IP addr (v4 or v6),
+        // skip resolving the dns and start connecting right away.
+        let state = if let Some(addrs) = dns::IpAddrs::try_parse(host, port) {
+            State::Connecting(ConnectingTcp {
+                addrs: addrs,
+                current: None
+            })
+        } else {
+            let work = self.resolver.query_a(&host)
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+            State::Resolving(Box::new(work), port)
+        };
+
         HttpConnecting {
-            state: State::Lazy(host.into(), port),
+            state,
             handle: self.handle.clone(),
             keep_alive_timeout: self.keep_alive_timeout,
         }
@@ -151,7 +165,6 @@ pub struct HttpConnecting {
 }
 
 enum State {
-    Lazy(String, u16),
     Resolving(Box<Future<Item=AResults, Error=io::Error>>, u16),
     Connecting(ConnectingTcp),
     Error(Option<io::Error>),
@@ -165,22 +178,6 @@ impl Future for HttpConnecting {
         loop {
             let state;
             match self.state {
-                State::Lazy(ref mut host, port) => {
-                    // If the host is already an IP addr (v4 or v6),
-                    // skip resolving the dns and start connecting right away.
-                    if let Some(addrs) = dns::IpAddrs::try_parse(host, port) {
-                        state = State::Connecting(ConnectingTcp {
-                            addrs: addrs,
-                            current: None
-                        })
-                    } else {
-                        let host = mem::replace(host, String::new());
-                        let resolver = FutureResolver::new().unwrap();
-                        let work = resolver.query_a(&host)
-                            .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
-                        state = State::Resolving(Box::new(work), port);
-                    }
-                },
                 State::Resolving(ref mut future, ref port) => {
                     match try!(future.poll()) {
                         Async::NotReady => return Ok(Async::NotReady),
