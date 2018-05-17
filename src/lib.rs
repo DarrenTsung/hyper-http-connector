@@ -5,10 +5,8 @@
 #[macro_use] extern crate futures;
 
 extern crate futures_cpupool;
-extern crate http;
 extern crate hyper;
 extern crate tokio_core;
-extern crate tokio_io;
 extern crate tokio_service;
 
 use std::error::Error as StdError;
