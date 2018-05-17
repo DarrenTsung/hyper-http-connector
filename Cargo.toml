@@ -1,0 +1,17 @@
+[package]
+name = "hyper-http-connector"
+version = "0.1.0"
+authors = ["Darren Tsung <darren@onesignal.com>"]
+
+[lib]
+doctest = false
+
+[dependencies]
+hyper = "0.11"
+futures = "0.1"
+tokio-io = "0.1"
+http = "0.1.5"
+futures-cpupool = "0.1.6"
+tokio-core = "0.1.11"
+log = "0.4"
+tokio-service = "0.1"
