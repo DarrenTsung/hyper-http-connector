@@ -28,11 +28,11 @@ use trust_dns_resolver::ResolverFuture;
 mod dns;
 
 /// A connector for the `http` scheme.
-#[derive(Clone)]
 pub struct HttpConnector {
     enforce_http: bool,
     handle: Handle,
     keep_alive_timeout: Option<Duration>,
+    resolver: ResolverFuture,
 }
 
 impl HttpConnector {
@@ -43,6 +43,11 @@ impl HttpConnector {
             enforce_http: true,
             handle: handle.clone(),
             keep_alive_timeout: None,
+            resolver: ResolverFuture::new(
+                ResolverConfig::default(),
+                ResolverOpts::default(),
+                handle,
+            ),
         }
     }
 
@@ -102,8 +107,18 @@ impl Service for HttpConnector {
             },
         };
 
+        let state = if let Some(addrs) = dns::IpAddrs::try_parse(host, port) {
+            State::Connecting(ConnectingTcp {
+                addrs: addrs,
+                current: None
+            })
+        } else {
+            let work = self.resolver.lookup_ip(&host);
+            State::Resolving(work, port)
+        };
+
         HttpConnecting {
-            state: State::Lazy(host.into(), port),
+            state,
             handle: self.handle.clone(),
             keep_alive_timeout: self.keep_alive_timeout,
         }
@@ -151,7 +166,7 @@ pub struct HttpConnecting {
 }
 
 enum State {
-    Lazy(String, u16),
+    // Lazy(&mut ResolverFuture, String, u16),
     Resolving(LookupIpFuture, u16),
     Connecting(ConnectingTcp),
     Error(Option<io::Error>),
@@ -165,26 +180,21 @@ impl Future for HttpConnecting {
         loop {
             let state;
             match self.state {
-                State::Lazy(ref mut host, port) => {
-                    // If the host is already an IP addr (v4 or v6),
-                    // skip resolving the dns and start connecting right away.
-                    if let Some(addrs) = dns::IpAddrs::try_parse(host, port) {
-                        state = State::Connecting(ConnectingTcp {
-                            addrs: addrs,
-                            current: None
-                        })
-                    } else {
-                        let host = mem::replace(host, String::new());
-                        let resolver = ResolverFuture::new(
-                            ResolverConfig::default(),
-                            ResolverOpts::default(),
-                            &self.handle,
-                        );
-
-                        let work = resolver.lookup_ip(&host);
-                        state = State::Resolving(work, port);
-                    }
-                },
+                // State::Lazy(ref mut resolver, ref mut host, port) => {
+                //     // If the host is already an IP addr (v4 or v6),
+                //     // skip resolving the dns and start connecting right away.
+                //     if let Some(addrs) = dns::IpAddrs::try_parse(host, port) {
+                //         state = State::Connecting(ConnectingTcp {
+                //             addrs: addrs,
+                //             current: None
+                //         })
+                //     } else {
+                //         let host = mem::replace(host, String::new());
+                //
+                //         let work = resolver.lookup_ip(&host);
+                //         state = State::Resolving(work, port);
+                //     }
+                // },
                 State::Resolving(ref mut future, ref port) => {
                     match try!(future.poll()) {
                         Async::NotReady => return Ok(Async::NotReady),
