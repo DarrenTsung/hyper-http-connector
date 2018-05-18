@@ -12,7 +12,6 @@ extern crate trust_dns_resolver;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
-use std::mem;
 use std::time::Duration;
 
 use futures::{Future, Poll, Async};
@@ -38,16 +37,12 @@ pub struct HttpConnector {
 impl HttpConnector {
     /// Construct a new HttpConnector.
     #[inline]
-    pub fn new(handle: &Handle) -> HttpConnector {
+    pub fn new(handle: &Handle, resolver: ResolverFuture) -> HttpConnector {
         HttpConnector {
             enforce_http: true,
             handle: handle.clone(),
             keep_alive_timeout: None,
-            resolver: ResolverFuture::new(
-                ResolverConfig::default(),
-                ResolverOpts::default(),
-                handle,
-            ),
+            resolver,
         }
     }
 
@@ -113,7 +108,7 @@ impl Service for HttpConnector {
                 current: None
             })
         } else {
-            let work = self.resolver.lookup_ip(&host);
+            let work = self.resolver.lookup_ip(host);
             State::Resolving(work, port)
         };
 
