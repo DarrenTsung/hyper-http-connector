@@ -3,10 +3,12 @@
 //! This is useful if you want to make modifications on it.
 #[macro_use] extern crate log;
 #[macro_use] extern crate futures;
+#[macro_use] extern crate lazy_static;
 
 extern crate hyper;
 extern crate tokio_core;
 extern crate tokio_service;
+extern crate tokio;
 extern crate trust_dns_resolver;
 
 use std::error::Error as StdError;
@@ -20,29 +22,28 @@ use tokio_core::net::{TcpStream, TcpStreamNew};
 use tokio_core::reactor::Handle;
 use tokio_service::Service;
 
-use trust_dns_resolver::config::*;
 use trust_dns_resolver::lookup_ip::{LookupIpFuture};
-use trust_dns_resolver::ResolverFuture;
 
 mod dns;
+mod trust_dns;
+
+use self::trust_dns::GLOBAL_DNS_RESOLVER;
 
 /// A connector for the `http` scheme.
 pub struct HttpConnector {
     enforce_http: bool,
     handle: Handle,
     keep_alive_timeout: Option<Duration>,
-    resolver: ResolverFuture,
 }
 
 impl HttpConnector {
     /// Construct a new HttpConnector.
     #[inline]
-    pub fn new(handle: &Handle, resolver: ResolverFuture) -> HttpConnector {
+    pub fn new(handle: &Handle) -> HttpConnector {
         HttpConnector {
             enforce_http: true,
             handle: handle.clone(),
             keep_alive_timeout: None,
-            resolver,
         }
     }
 
@@ -108,7 +109,7 @@ impl Service for HttpConnector {
                 current: None
             })
         } else {
-            let work = self.resolver.lookup_ip(host);
+            let work = GLOBAL_DNS_RESOLVER.lookup_ip(host);
             State::Resolving(work, port)
         };
 
