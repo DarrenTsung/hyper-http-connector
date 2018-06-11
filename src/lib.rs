@@ -35,7 +35,8 @@ use tokio_reactor::Handle;
 use tokio_tcp::{ConnectFuture, TcpStream};
 use futures_cpupool::{Builder as CpuPoolBuilder};
 
-use trust_dns_resolver::lookup_ip::LookupIpFuture;
+use trust_dns_resolver::lookup_ip::{LookupIp, LookupIpFuture};
+use trust_dns_resolver::error::ResolveError;
 
 mod dns;
 mod trust_dns;
@@ -211,7 +212,7 @@ impl Connect for HttpConnector {
         };
 
         HttpConnecting {
-            state: State::Lazy(host.into(), port, self.local_address),
+            state: State::Lazy(self.executor.clone(), host.into(), port, self.local_address),
             handle: self.handle.clone(),
             keep_alive_timeout: self.keep_alive_timeout,
             nodelay: self.nodelay,
@@ -261,8 +262,8 @@ pub struct HttpConnecting {
 }
 
 enum State {
-    Lazy(String, u16, Option<IpAddr>),
-    Resolving(LookupIpFuture, u16, Option<IpAddr>),
+    Lazy(HttpConnectExecutor, String, u16, Option<IpAddr>),
+    Resolving(oneshot::SpawnHandle<LookupIp, ResolveError>, u16, Option<IpAddr>),
     Connecting(ConnectingTcp),
     Error(Option<io::Error>),
 }
@@ -275,7 +276,7 @@ impl Future for HttpConnecting {
         loop {
             let state;
             match self.state {
-                State::Lazy(ref mut host, port, local_addr) => {
+                State::Lazy(ref executor, ref mut host, port, local_addr) => {
                     // If the host is already an IP addr (v4 or v6),
                     // skip resolving the dns and start connecting right away.
                     if let Some(addrs) = dns::IpAddrs::try_parse(host, port) {
@@ -286,11 +287,13 @@ impl Future for HttpConnecting {
                         })
                     } else {
                         let work = GLOBAL_DNS_RESOLVER.lookup_ip(host.as_str());
-                        state = State::Resolving(work, port, local_addr);
+                        state = State::Resolving(oneshot::spawn(work, executor), port, local_addr);
                     }
                 }
                 State::Resolving(ref mut future, port, local_addr) => {
-                    match try!(future.poll()) {
+                    match future.poll()
+                        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.kind().description()))?
+                    {
                         Async::NotReady => return Ok(Async::NotReady),
                         Async::Ready(lookup_ip) => {
                             state = State::Connecting(ConnectingTcp {
