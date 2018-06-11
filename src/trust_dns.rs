@@ -1,7 +1,7 @@
 use std;
 
 use tokio;
-use trust_dns_resolver::{ResolverFuture};
+use trust_dns_resolver::ResolverFuture;
 
 lazy_static! {
     // First we need to setup the global Resolver
