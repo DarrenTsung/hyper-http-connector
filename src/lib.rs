@@ -15,20 +15,25 @@ extern crate tokio;
 extern crate tokio_reactor;
 extern crate tokio_tcp;
 extern crate trust_dns_resolver;
+extern crate futures_cpupool;
 
 use std::borrow::Cow;
 use std::error::Error as StdError;
+use std::sync::Arc;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use futures::{Async, Future, Poll};
+use futures::future::{Executor, ExecuteError};
+use futures::sync::oneshot;
 use http::uri::Scheme;
 use hyper::client::connect::{Connect, Connected, Destination};
 use net2::TcpBuilder;
 use tokio_reactor::Handle;
 use tokio_tcp::{ConnectFuture, TcpStream};
+use futures_cpupool::{Builder as CpuPoolBuilder};
 
 use trust_dns_resolver::lookup_ip::LookupIpFuture;
 
@@ -36,6 +41,7 @@ mod dns;
 mod trust_dns;
 
 use self::trust_dns::GLOBAL_DNS_RESOLVER;
+use self::http_connector::HttpConnectorBlockingTask;
 
 fn connect(
     addr: &SocketAddr,
@@ -76,6 +82,7 @@ fn connect(
 /// Performs DNS resolution in a thread pool, and then connects over TCP.
 #[derive(Clone)]
 pub struct HttpConnector {
+    executor: HttpConnectExecutor,
     enforce_http: bool,
     handle: Option<Handle>,
     keep_alive_timeout: Option<Duration>,
@@ -88,17 +95,32 @@ impl HttpConnector {
     ///
     /// Takes number of DNS worker threads.
     #[inline]
-    pub fn new() -> HttpConnector {
-        HttpConnector::new_with_handle_opt(None)
+    pub fn new(threads: usize) -> HttpConnector {
+        HttpConnector::new_with_handle_opt(threads, None)
     }
 
     /// Construct a new HttpConnector with a specific Tokio handle.
-    pub fn new_with_handle(handle: Handle) -> HttpConnector {
-        HttpConnector::new_with_handle_opt(Some(handle))
+    pub fn new_with_handle(threads: usize, handle: Handle) -> HttpConnector {
+        HttpConnector::new_with_handle_opt(threads, Some(handle))
     }
 
-    fn new_with_handle_opt(handle: Option<Handle>) -> HttpConnector {
+    fn new_with_handle_opt(threads: usize, handle: Option<Handle>) -> HttpConnector {
+        let pool = CpuPoolBuilder::new()
+        .name_prefix("hyper-dns")
+        .pool_size(threads)
+        .create();
+
+        HttpConnector::new_with_executor(pool, handle)
+    }
+
+    /// Construct a new HttpConnector.
+    ///
+    /// Takes an executor to run blocking tasks on.
+    pub fn new_with_executor<E: 'static>(executor: E, handle: Option<Handle>) -> HttpConnector
+    where E: Executor<HttpConnectorBlockingTask> + Send + Sync
+    {
         HttpConnector {
+            executor: HttpConnectExecutor(Arc::new(executor)),
             enforce_http: true,
             handle,
             keep_alive_timeout: None,
@@ -335,6 +357,40 @@ impl ConnectingTcp {
 
             return Err(err.take().expect("missing connect error"));
         }
+    }
+}
+
+// Make this Future unnameable outside of this crate.
+mod http_connector {
+    use super::*;
+    // Blocking task to be executed on a thread pool.
+    pub struct HttpConnectorBlockingTask {
+        pub(super) work: oneshot::Execute<LookupIpFuture>
+    }
+
+    impl fmt::Debug for HttpConnectorBlockingTask {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.pad("HttpConnectorBlockingTask")
+        }
+    }
+
+    impl Future for HttpConnectorBlockingTask {
+        type Item = ();
+        type Error = ();
+
+        fn poll(&mut self) -> Poll<(), ()> {
+            self.work.poll()
+        }
+    }
+}
+
+#[derive(Clone)]
+struct HttpConnectExecutor(Arc<Executor<HttpConnectorBlockingTask> + Send + Sync>);
+
+impl Executor<oneshot::Execute<LookupIpFuture>> for HttpConnectExecutor {
+    fn execute(&self, future: oneshot::Execute<LookupIpFuture>) -> Result<(), ExecuteError<oneshot::Execute<LookupIpFuture>>> {
+        self.0.execute(HttpConnectorBlockingTask { work: future })
+        .map_err(|err| ExecuteError::new(err.kind(), err.into_future().work))
     }
 }
 
