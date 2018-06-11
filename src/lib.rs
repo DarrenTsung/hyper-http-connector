@@ -5,6 +5,8 @@
 extern crate log;
 #[macro_use]
 extern crate futures;
+#[macro_use]
+extern crate lazy_static;
 
 extern crate http;
 extern crate hyper;
@@ -13,12 +15,16 @@ extern crate tokio;
 extern crate tokio_reactor;
 extern crate tokio_tcp;
 extern crate futures_cpupool;
+extern crate c_ares_resolver;
+extern crate c_ares;
+
+use c_ares_resolver::CAresFuture;
+use c_ares::AResults;
 
 use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
-use std::mem;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use std::sync::Arc;
@@ -35,6 +41,7 @@ use tokio_tcp::{ConnectFuture, TcpStream};
 
 mod dns;
 
+use self::dns::GLOBAL_RESOLVER;
 use self::http_connector::HttpConnectorBlockingTask;
 
 fn connect(
@@ -255,7 +262,7 @@ pub struct HttpConnecting {
 
 enum State {
     Lazy(HttpConnectExecutor, String, u16, Option<IpAddr>),
-    Resolving(oneshot::SpawnHandle<dns::IpAddrs, io::Error>, Option<IpAddr>),
+    Resolving(oneshot::SpawnHandle<AResults, c_ares::Error>, u16, Option<IpAddr>),
     Connecting(ConnectingTcp),
     Error(Option<io::Error>),
 }
@@ -278,17 +285,18 @@ impl Future for HttpConnecting {
                             current: None
                         })
                     } else {
-                        let host = mem::replace(host, String::new());
-                        let work = dns::Work::new(host, port);
-                        state = State::Resolving(oneshot::spawn(work, executor), local_addr);
+                        let work = GLOBAL_RESOLVER.query_a(&host);
+                        state = State::Resolving(oneshot::spawn(work, executor), port, local_addr);
                     }
                 },
-                State::Resolving(ref mut future, local_addr) => {
-                    match try!(future.poll()) {
+                State::Resolving(ref mut future, port, local_addr) => {
+                    match future.poll()
+                        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?
+                    {
                         Async::NotReady => return Ok(Async::NotReady),
-                        Async::Ready(addrs) => {
+                        Async::Ready(a_results) => {
                             state = State::Connecting(ConnectingTcp {
-                                addrs,
+                                addrs: dns::IpAddrs::new(port, a_results),
                                 local_addr,
                                 current: None,
                             })
@@ -359,7 +367,7 @@ mod http_connector {
     use super::*;
     // Blocking task to be executed on a thread pool.
     pub struct HttpConnectorBlockingTask {
-        pub(super) work: oneshot::Execute<dns::Work>
+        pub(super) work: oneshot::Execute<CAresFuture<AResults>>
     }
 
     impl fmt::Debug for HttpConnectorBlockingTask {
@@ -381,8 +389,8 @@ mod http_connector {
 #[derive(Clone)]
 struct HttpConnectExecutor(Arc<Executor<HttpConnectorBlockingTask> + Send + Sync>);
 
-impl Executor<oneshot::Execute<dns::Work>> for HttpConnectExecutor {
-    fn execute(&self, future: oneshot::Execute<dns::Work>) -> Result<(), ExecuteError<oneshot::Execute<dns::Work>>> {
+impl Executor<oneshot::Execute<CAresFuture<AResults>>> for HttpConnectExecutor {
+    fn execute(&self, future: oneshot::Execute<CAresFuture<AResults>>) -> Result<(), ExecuteError<oneshot::Execute<CAresFuture<AResults>>>> {
         self.0.execute(HttpConnectorBlockingTask { work: future })
         .map_err(|err| ExecuteError::new(err.kind(), err.into_future().work))
     }

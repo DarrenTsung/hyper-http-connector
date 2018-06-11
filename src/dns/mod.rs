@@ -1,40 +1,29 @@
-use std::io;
 use std::net::{
     Ipv4Addr, Ipv6Addr,
-    SocketAddr, ToSocketAddrs,
+    SocketAddr,
     SocketAddrV4, SocketAddrV6,
 };
 use std::vec;
+use c_ares::AResults;
 
-use ::futures::{Async, Future, Poll};
+mod c_ares;
 
-pub struct Work {
-    host: String,
-    port: u16
-}
-
-impl Work {
-    pub fn new(host: String, port: u16) -> Work {
-        Work { host: host, port: port }
-    }
-}
-
-impl Future for Work {
-    type Item = IpAddrs;
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        debug!("resolving host={:?}, port={:?}", self.host, self.port);
-        (&*self.host, self.port).to_socket_addrs()
-            .map(|i| Async::Ready(IpAddrs { iter: i }))
-    }
-}
+pub use self::c_ares::GLOBAL_RESOLVER;
 
 pub struct IpAddrs {
     iter: vec::IntoIter<SocketAddr>,
 }
 
 impl IpAddrs {
+    pub fn new(port: u16, a_results: AResults) -> IpAddrs {
+        let ips = a_results.iter().map(|res| {
+            SocketAddr::V4(SocketAddrV4::new(res.ipv4(), port))
+        }).collect::<Vec<_>>();
+        IpAddrs {
+            iter: ips.into_iter(),
+        }
+    }
+
     pub fn try_parse(host: &str, port: u16) -> Option<IpAddrs> {
         if let Ok(addr) = host.parse::<Ipv4Addr>() {
             let addr = SocketAddrV4::new(addr, port);
