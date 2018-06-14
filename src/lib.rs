@@ -167,6 +167,12 @@ impl HttpConnector {
     }
 }
 
+impl Drop for HttpConnector {
+    fn drop(&mut self) {
+        println!("HttpConnector is dropping!!!");
+    }
+}
+
 impl fmt::Debug for HttpConnector {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

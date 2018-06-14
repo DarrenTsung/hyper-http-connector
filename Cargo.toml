@@ -6,7 +6,7 @@ authors = ["Darren Tsung <darren@onesignal.com>"]
 [dependencies]
 hyper = "0.12"
 futures = "0.1"
-futures-cpupool = "0.1.6"
+futures-cpupool = { git = "https://github.com/DarrenTsung/futures-cpupool-executor", branch = "tokio-executor" }
 log = "0.4"
 tokio-tcp = "0.1"
 tokio-reactor = "0.1"
@@ -15,3 +15,4 @@ http = "0.1.5"
 tokio = "0.1"
 net2 = "0.2.32"
 lazy_static = "1.0"
+tokio-executor = "0.1"

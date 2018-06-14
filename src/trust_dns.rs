@@ -18,6 +18,7 @@ lazy_static! {
         //
         // This thread will manage the actual resolution runtime
         thread::spawn(move || {
+            println!("Starting up global resolver thread!");
             // A runtime for this new thread
             let mut runtime = tokio::runtime::current_thread::Runtime::new().expect("failed to launch Runtime");
 
@@ -51,6 +52,7 @@ lazy_static! {
             drop(started);
 
             runtime.run().expect("Resolver Thread shutdown!");
+            println!("Shutting down global resolver thread!");
         });
 
         // Wait for the thread to start up.
@@ -62,6 +64,7 @@ lazy_static! {
 
         // take the started resolver
         let resolver = std::mem::replace(&mut *resolver, None);
+        println!("Found a resolver: !");
 
         // set the global resolver
         resolver.expect("resolver should not be none")
