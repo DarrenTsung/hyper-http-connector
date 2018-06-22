@@ -306,12 +306,12 @@ impl Future for HttpConnecting {
                 State::Connecting(ref mut c) => {
                     let sock = try_ready!(c.poll(&self.handle));
 
-                    if let Some(dur) = self.keep_alive_timeout {
-                        sock.set_keepalive(Some(dur))?;
-                    }
-
-                    sock.set_linger(None)?;
-                    sock.set_nodelay(self.nodelay)?;
+                    // if let Some(dur) = self.keep_alive_timeout {
+                    //     sock.set_keepalive(Some(dur))?;
+                    // }
+                    //
+                    // sock.set_linger(None)?;
+                    // sock.set_nodelay(self.nodelay)?;
 
                     return Ok(Async::Ready((sock, Connected::new())));
                 }
