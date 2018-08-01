@@ -10,22 +10,30 @@ mod c_ares;
 pub use self::c_ares::GLOBAL_RESOLVER;
 
 pub struct IpAddrs {
-    inner: SingleOrShifted<SocketAddr>,
+    ips: Vec<SocketAddr>,
+    current: usize,
+    offset: usize,
 }
 
 impl IpAddrs {
-    pub fn new(port: u16, a_results: AResults, index: usize) -> IpAddrs {
+    pub fn new(port: u16, a_results: AResults, offset: usize) -> IpAddrs {
         // Sort list by ips returned, we need a set ordering for the round-robin
         // selection of ips to work correctly.
-        let mut ips = a_results.iter().map(|res| res.ipv4()).collect::<Vec<_>>();
+        let ips = a_results.iter().map(|res| res.ipv4()).collect::<Vec<_>>();
+        IpAddrs::new_from_ipv4s(port, ips, offset)
+    }
+
+    fn new_from_ipv4s(port: u16, mut ips: Vec<Ipv4Addr>, offset: usize) -> IpAddrs {
         ips.sort();
 
         let ips = ips.into_iter().map(|ip| {
-            Some(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+            SocketAddr::V4(SocketAddrV4::new(ip, port))
         }).collect::<Vec<_>>();
 
         IpAddrs {
-            inner: SingleOrShifted::ShiftedVec(ips, index),
+            ips,
+            current: 0,
+            offset,
         }
     }
 
@@ -33,14 +41,18 @@ impl IpAddrs {
         if let Ok(addr) = host.parse::<Ipv4Addr>() {
             let addr = SocketAddrV4::new(addr, port);
             return Some(IpAddrs {
-                inner: SingleOrShifted::Single(Some(SocketAddr::V4(addr))),
+                ips: vec![SocketAddr::V4(addr)],
+                current: 0,
+                offset: 0,
             })
         }
 
         if let Ok(addr) = host.parse::<Ipv6Addr>() {
             let addr = SocketAddrV6::new(addr, port, 0, 0);
             return Some(IpAddrs {
-                inner: SingleOrShifted::Single(Some(SocketAddr::V6(addr))),
+                ips: vec![SocketAddr::V6(addr)],
+                current: 0,
+                offset: 0,
             })
         }
 
@@ -53,31 +65,14 @@ impl Iterator for IpAddrs {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
-    }
-}
-
-enum SingleOrShifted<T> {
-    Single(Option<T>),
-    ShiftedVec(Vec<Option<T>>, usize),
-}
-
-impl<T> Iterator for SingleOrShifted<T> {
-    type Item = T;
-
-    #[inline]
-    fn next(&mut self) -> Option<T> {
-        match self {
-            SingleOrShifted::Single(ref mut item) => {
-                item.take()
-            },
-            SingleOrShifted::ShiftedVec(ref mut items, ref mut index) => {
-                let len = items.len();
-                let ret = items[*index % len].take();
-                *index += 1;
-                ret
-            },
+        if self.current == self.ips.len() {
+            return None;
         }
+
+        let index = (self.current + self.offset) % self.ips.len();
+        let item = self.ips[index];
+        self.current += 1;
+        Some(item)
     }
 }
 
@@ -85,25 +80,44 @@ impl<T> Iterator for SingleOrShifted<T> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn single_or_shifted_single_works() {
-        let mut a = SingleOrShifted::Single(Some(10));
-        assert_eq!(Some(10), a.next());
-        assert_eq!(None, a.next());
+    macro_rules! assert_eq_ip {
+        ($elem:expr, $expected:expr) => {
+            match $elem {
+                Some(SocketAddr::V4(addr)) => assert_eq!(addr.ip(), $expected),
+                _ => panic!("Not a Some(SocketAddrV4)!"),
+            }
+        };
     }
 
     #[test]
-    fn single_or_shifted_shifted_works() {
-        let mut a = SingleOrShifted::ShiftedVec(vec![Some(10), Some(20), Some(30)], 0);
-        assert_eq!(Some(10), a.next());
-        assert_eq!(Some(20), a.next());
-        assert_eq!(Some(30), a.next());
-        assert_eq!(None, a.next());
+    fn it_sorts_by_ip() {
+        let mut a = IpAddrs::new_from_ipv4s(999, vec![
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(127, 0, 0, 4),
+            Ipv4Addr::new(127, 0, 0, 3),
+            Ipv4Addr::new(127, 0, 0, 2)
+        ], 0);
 
-        let mut b = SingleOrShifted::ShiftedVec(vec![Some(10), Some(20), Some(30)], 2);
-        assert_eq!(Some(30), b.next());
-        assert_eq!(Some(10), b.next());
-        assert_eq!(Some(20), b.next());
-        assert_eq!(None, b.next());
+        assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 1));
+        assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 2));
+        assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 3));
+        assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 4));
+        assert_eq!(a.next(), None);
+    }
+
+    #[test]
+    fn shifted_offsets_work() {
+        let mut a = IpAddrs::new_from_ipv4s(999, vec![
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(127, 0, 0, 4),
+            Ipv4Addr::new(127, 0, 0, 3),
+            Ipv4Addr::new(127, 0, 0, 2)
+        ], 2);
+
+        assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 3));
+        assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 4));
+        assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 1));
+        assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 2));
+        assert_eq!(a.next(), None);
     }
 }
