@@ -28,7 +28,7 @@ use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::{Async, Future, Poll};
 use futures::future::{Executor, ExecuteError};
@@ -90,6 +90,7 @@ pub struct HttpConnector {
     keep_alive_timeout: Option<Duration>,
     nodelay: bool,
     local_address: Option<IpAddr>,
+    round_robin_map: Arc<Mutex<HashMap<Arc<String>, usize>>>,
 }
 
 impl HttpConnector {
@@ -127,6 +128,7 @@ impl HttpConnector {
             keep_alive_timeout: None,
             nodelay: false,
             local_address: None,
+            round_robin_map: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -211,12 +213,13 @@ impl Connect for HttpConnector {
             },
         };
 
+        let host = Arc::new(host.into());
+
         HttpConnecting {
-            state: State::Lazy(self.executor.clone(), Arc::new(host.into()), port, self.local_address),
+            state: State::Lazy(self.executor.clone(), host, port, self.local_address, Arc::clone(&self.round_robin_map)),
             handle: self.handle.clone(),
             keep_alive_timeout: self.keep_alive_timeout,
             nodelay: self.nodelay,
-            round_robin_map: HashMap::new(),
         }
     }
 }
@@ -228,7 +231,6 @@ fn invalid_url(err: InvalidUrl, handle: &Option<Handle>) -> HttpConnecting {
         handle: handle.clone(),
         keep_alive_timeout: None,
         nodelay: false,
-        round_robin_map: HashMap::new(),
     }
 }
 
@@ -261,13 +263,11 @@ pub struct HttpConnecting {
     handle: Option<Handle>,
     keep_alive_timeout: Option<Duration>,
     nodelay: bool,
-
-    round_robin_map: HashMap<Arc<String>, usize>,
 }
 
 enum State {
-    Lazy(HttpConnectExecutor, Arc<String>, u16, Option<IpAddr>),
-    Resolving(oneshot::SpawnHandle<AResults, c_ares::Error>, Arc<String>, u16, Option<IpAddr>),
+    Lazy(HttpConnectExecutor, Arc<String>, u16, Option<IpAddr>, Arc<Mutex<HashMap<Arc<String>, usize>>>),
+    Resolving(oneshot::SpawnHandle<AResults, c_ares::Error>, Arc<String>, u16, Option<IpAddr>, Arc<Mutex<HashMap<Arc<String>, usize>>>),
     Connecting(ConnectingTcp),
     Error(Option<io::Error>),
 }
@@ -279,7 +279,7 @@ impl Future for HttpConnecting {
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         loop {
             let state = match self.state {
-                State::Lazy(ref executor, ref host, port, local_addr) => {
+                State::Lazy(ref executor, ref host, port, local_addr, ref round_robin_map) => {
                     // If the host is already an IP addr (v4 or v6),
                     // skip resolving the dns and start connecting right away.
                     if let Some(addrs) = dns::IpAddrs::try_parse(host, port) {
@@ -290,16 +290,19 @@ impl Future for HttpConnecting {
                         })
                     } else {
                         let work = GLOBAL_RESOLVER.query_a(host);
-                        State::Resolving(oneshot::spawn(work, executor), Arc::clone(host), port, local_addr)
+                        State::Resolving(oneshot::spawn(work, executor), Arc::clone(host), port, local_addr, Arc::clone(round_robin_map))
                     }
                 },
-                State::Resolving(ref mut future, ref host, port, local_addr) => {
+                State::Resolving(ref mut future, ref host, port, local_addr, ref round_robin_map) => {
                     match future.poll()
                         .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?
                     {
                         Async::NotReady => return Ok(Async::NotReady),
                         Async::Ready(a_results) => {
-                            let shift_index = *self.round_robin_map.entry(Arc::clone(host))
+                            let shift_index = *round_robin_map
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .entry(Arc::clone(&host))
                                 .and_modify(|e| { *e = e.overflowing_add(1).0 })
                                 .or_insert(0);
 
