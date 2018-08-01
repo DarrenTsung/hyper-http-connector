@@ -303,7 +303,7 @@ impl Future for HttpConnecting {
                         Async::NotReady => return Ok(Async::NotReady),
                         Async::Ready(a_results) => {
                             let shift_index = *self.round_robin_map.entry(host)
-                                .and_modify(|e| { *e += 1 })
+                                .and_modify(|e| { *e = e.overflowing_add(1).0 })
                                 .or_insert(0);
 
                             State::Connecting(ConnectingTcp {
