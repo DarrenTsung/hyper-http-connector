@@ -3,7 +3,6 @@ use std::net::{
     SocketAddr,
     SocketAddrV4, SocketAddrV6,
 };
-use std::vec;
 use c_ares::AResults;
 
 mod c_ares;
@@ -11,36 +10,114 @@ mod c_ares;
 pub use self::c_ares::GLOBAL_RESOLVER;
 
 pub struct IpAddrs {
-    iter: vec::IntoIter<SocketAddr>,
+    ips: Vec<SocketAddr>,
+    current: usize,
+    offset: usize,
 }
 
 impl IpAddrs {
-    pub fn new(port: u16, a_results: AResults) -> IpAddrs {
-        let ips = a_results.iter().map(|res| {
-            SocketAddr::V4(SocketAddrV4::new(res.ipv4(), port))
+    pub fn new(port: u16, a_results: AResults, offset: usize) -> IpAddrs {
+        // Sort list by ips returned, we need a set ordering for the round-robin
+        // selection of ips to work correctly.
+        let ips = a_results.iter().map(|res| res.ipv4()).collect::<Vec<_>>();
+        IpAddrs::new_from_ipv4s(port, ips, offset)
+    }
+
+    fn new_from_ipv4s(port: u16, mut ips: Vec<Ipv4Addr>, offset: usize) -> IpAddrs {
+        ips.sort();
+
+        let ips = ips.into_iter().map(|ip| {
+            SocketAddr::V4(SocketAddrV4::new(ip, port))
         }).collect::<Vec<_>>();
+
         IpAddrs {
-            iter: ips.into_iter(),
+            ips,
+            current: 0,
+            offset,
         }
     }
 
     pub fn try_parse(host: &str, port: u16) -> Option<IpAddrs> {
         if let Ok(addr) = host.parse::<Ipv4Addr>() {
             let addr = SocketAddrV4::new(addr, port);
-            return Some(IpAddrs { iter: vec![SocketAddr::V4(addr)].into_iter() })
+            return Some(IpAddrs {
+                ips: vec![SocketAddr::V4(addr)],
+                current: 0,
+                offset: 0,
+            })
         }
+
         if let Ok(addr) = host.parse::<Ipv6Addr>() {
             let addr = SocketAddrV6::new(addr, port, 0, 0);
-            return Some(IpAddrs { iter: vec![SocketAddr::V6(addr)].into_iter() })
+            return Some(IpAddrs {
+                ips: vec![SocketAddr::V6(addr)],
+                current: 0,
+                offset: 0,
+            })
         }
+
         None
     }
 }
 
 impl Iterator for IpAddrs {
     type Item = SocketAddr;
+
     #[inline]
-    fn next(&mut self) -> Option<SocketAddr> {
-        self.iter.next()
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current == self.ips.len() {
+            return None;
+        }
+
+        let index = (self.current + self.offset) % self.ips.len();
+        let item = self.ips[index];
+        self.current += 1;
+        Some(item)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    macro_rules! assert_eq_ip {
+        ($elem:expr, $expected:expr) => {
+            match $elem {
+                Some(SocketAddr::V4(addr)) => assert_eq!(addr.ip(), $expected),
+                _ => panic!("Not a Some(SocketAddrV4)!"),
+            }
+        };
+    }
+
+    #[test]
+    fn it_sorts_by_ip() {
+        let mut a = IpAddrs::new_from_ipv4s(999, vec![
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(127, 0, 0, 4),
+            Ipv4Addr::new(127, 0, 0, 3),
+            Ipv4Addr::new(127, 0, 0, 2)
+        ], 0);
+
+        assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 1));
+        assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 2));
+        assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 3));
+        assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 4));
+        assert_eq!(a.next(), None);
+    }
+
+    #[test]
+    fn shifted_offsets_work() {
+        let mut a = IpAddrs::new_from_ipv4s(999, vec![
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(127, 0, 0, 4),
+            Ipv4Addr::new(127, 0, 0, 3),
+            Ipv4Addr::new(127, 0, 0, 2)
+        ], 2);
+
+        assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 3));
+        assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 4));
+        assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 1));
+        assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 2));
+        assert_eq!(a.next(), None);
     }
 }
