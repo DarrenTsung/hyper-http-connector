@@ -22,6 +22,8 @@ use c_ares_resolver::CAresFuture;
 use c_ares::AResults;
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::mem;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
@@ -215,6 +217,7 @@ impl Connect for HttpConnector {
             handle: self.handle.clone(),
             keep_alive_timeout: self.keep_alive_timeout,
             nodelay: self.nodelay,
+            round_robin_map: HashMap::new(),
         }
     }
 }
@@ -226,6 +229,7 @@ fn invalid_url(err: InvalidUrl, handle: &Option<Handle>) -> HttpConnecting {
         handle: handle.clone(),
         keep_alive_timeout: None,
         nodelay: false,
+        round_robin_map: HashMap::new(),
     }
 }
 
@@ -258,11 +262,14 @@ pub struct HttpConnecting {
     handle: Option<Handle>,
     keep_alive_timeout: Option<Duration>,
     nodelay: bool,
+
+    round_robin_map: HashMap<String, usize>,
 }
 
 enum State {
+    Uninitialized,
     Lazy(HttpConnectExecutor, String, u16, Option<IpAddr>),
-    Resolving(oneshot::SpawnHandle<AResults, c_ares::Error>, u16, Option<IpAddr>),
+    Resolving(oneshot::SpawnHandle<AResults, c_ares::Error>, String, u16, Option<IpAddr>),
     Connecting(ConnectingTcp),
     Error(Option<io::Error>),
 }
@@ -273,35 +280,39 @@ impl Future for HttpConnecting {
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         loop {
-            let state;
-            match self.state {
-                State::Lazy(ref executor, ref mut host, port, local_addr) => {
+            self.state = match mem::replace(&mut self.state, State::Uninitialized) {
+                State::Uninitialized => panic!("Should not be State::Uninitialized!"),
+                State::Lazy(executor, host, port, local_addr) => {
                     // If the host is already an IP addr (v4 or v6),
                     // skip resolving the dns and start connecting right away.
-                    if let Some(addrs) = dns::IpAddrs::try_parse(host, port) {
-                        state = State::Connecting(ConnectingTcp {
+                    if let Some(addrs) = dns::IpAddrs::try_parse(&host, port) {
+                        State::Connecting(ConnectingTcp {
                             addrs,
                             local_addr,
                             current: None
                         })
                     } else {
                         let work = GLOBAL_RESOLVER.query_a(&host);
-                        state = State::Resolving(oneshot::spawn(work, executor), port, local_addr);
+                        State::Resolving(oneshot::spawn(work, &executor), host, port, local_addr)
                     }
                 },
-                State::Resolving(ref mut future, port, local_addr) => {
+                State::Resolving(mut future, host, port, local_addr) => {
                     match future.poll()
                         .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?
                     {
                         Async::NotReady => return Ok(Async::NotReady),
                         Async::Ready(a_results) => {
-                            state = State::Connecting(ConnectingTcp {
-                                addrs: dns::IpAddrs::new(port, a_results),
+                            let shift_index = *self.round_robin_map.entry(host)
+                                .and_modify(|e| { *e += 1 })
+                                .or_insert(0);
+
+                            State::Connecting(ConnectingTcp {
+                                addrs: dns::IpAddrs::new(port, a_results, shift_index),
                                 local_addr,
                                 current: None,
                             })
                         }
-                    };
+                    }
                 }
                 State::Connecting(ref mut c) => {
                     let sock = try_ready!(c.poll(&self.handle));
@@ -317,7 +328,6 @@ impl Future for HttpConnecting {
                 }
                 State::Error(ref mut e) => return Err(e.take().expect("polled more than once")),
             }
-            self.state = state;
         }
     }
 }
