@@ -321,7 +321,6 @@ impl Future for HttpConnecting {
                         sock.set_keepalive(Some(dur))?;
                     }
 
-                    sock.set_linger(None)?;
                     sock.set_nodelay(self.nodelay)?;
 
                     return Ok(Async::Ready((sock, Connected::new())));
