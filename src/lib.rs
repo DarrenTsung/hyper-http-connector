@@ -8,18 +8,18 @@ extern crate futures;
 #[macro_use]
 extern crate lazy_static;
 
+extern crate c_ares;
+extern crate c_ares_resolver;
+extern crate futures_cpupool;
 extern crate http;
 extern crate hyper;
 extern crate net2;
 extern crate tokio;
 extern crate tokio_reactor;
 extern crate tokio_tcp;
-extern crate futures_cpupool;
-extern crate c_ares_resolver;
-extern crate c_ares;
 
-use c_ares_resolver::CAresFuture;
 use c_ares::AResults;
+use c_ares_resolver::CAresFuture;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -27,16 +27,16 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use futures::{Async, Future, Poll};
-use futures::future::{Executor, ExecuteError};
+use futures::future::{ExecuteError, Executor};
 use futures::sync::oneshot;
+use futures::{Async, Future, Poll};
+use futures_cpupool::Builder as CpuPoolBuilder;
 use http::uri::Scheme;
 use hyper::client::connect::{Connect, Connected, Destination};
 use net2::TcpBuilder;
-use futures_cpupool::{Builder as CpuPoolBuilder};
 use tokio_reactor::Handle;
 use tokio_tcp::{ConnectFuture, TcpStream};
 
@@ -109,9 +109,9 @@ impl HttpConnector {
 
     fn new_with_handle_opt(threads: usize, handle: Option<Handle>) -> HttpConnector {
         let pool = CpuPoolBuilder::new()
-        .name_prefix("hyper-dns")
-        .pool_size(threads)
-        .create();
+            .name_prefix("hyper-dns")
+            .pool_size(threads)
+            .create();
         HttpConnector::new_with_executor(pool, handle)
     }
 
@@ -119,7 +119,8 @@ impl HttpConnector {
     ///
     /// Takes an executor to run blocking tasks on.
     pub fn new_with_executor<E: 'static>(executor: E, handle: Option<Handle>) -> HttpConnector
-    where E: Executor<HttpConnectorBlockingTask> + Send + Sync
+    where
+        E: Executor<HttpConnectorBlockingTask> + Send + Sync,
     {
         HttpConnector {
             executor: HttpConnectExecutor(Arc::new(executor)),
@@ -216,7 +217,13 @@ impl Connect for HttpConnector {
         let host = Arc::new(host.into());
 
         HttpConnecting {
-            state: State::Lazy(self.executor.clone(), host, port, self.local_address, Arc::clone(&self.round_robin_map)),
+            state: State::Lazy(
+                self.executor.clone(),
+                host,
+                port,
+                self.local_address,
+                Arc::clone(&self.round_robin_map),
+            ),
             handle: self.handle.clone(),
             keep_alive_timeout: self.keep_alive_timeout,
             nodelay: self.nodelay,
@@ -266,8 +273,20 @@ pub struct HttpConnecting {
 }
 
 enum State {
-    Lazy(HttpConnectExecutor, Arc<String>, u16, Option<IpAddr>, Arc<Mutex<HashMap<Arc<String>, usize>>>),
-    Resolving(oneshot::SpawnHandle<AResults, c_ares::Error>, Arc<String>, u16, Option<IpAddr>, Arc<Mutex<HashMap<Arc<String>, usize>>>),
+    Lazy(
+        HttpConnectExecutor,
+        Arc<String>,
+        u16,
+        Option<IpAddr>,
+        Arc<Mutex<HashMap<Arc<String>, usize>>>,
+    ),
+    Resolving(
+        oneshot::SpawnHandle<AResults, c_ares::Error>,
+        Arc<String>,
+        u16,
+        Option<IpAddr>,
+        Arc<Mutex<HashMap<Arc<String>, usize>>>,
+    ),
     Connecting(ConnectingTcp),
     Error(Option<io::Error>),
 }
@@ -286,34 +305,45 @@ impl Future for HttpConnecting {
                         State::Connecting(ConnectingTcp {
                             addrs,
                             local_addr,
-                            current: None
+                            current: None,
                         })
                     } else {
                         let work = GLOBAL_RESOLVER.query_a(host);
-                        State::Resolving(oneshot::spawn(work, executor), Arc::clone(host), port, local_addr, Arc::clone(round_robin_map))
-                    }
-                },
-                State::Resolving(ref mut future, ref host, port, local_addr, ref round_robin_map) => {
-                    match future.poll()
-                        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?
-                    {
-                        Async::NotReady => return Ok(Async::NotReady),
-                        Async::Ready(a_results) => {
-                            let shift_index = *round_robin_map
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .entry(Arc::clone(&host))
-                                .and_modify(|e| { *e = e.overflowing_add(1).0 })
-                                .or_insert(0);
-
-                            State::Connecting(ConnectingTcp {
-                                addrs: dns::IpAddrs::new(port, a_results, shift_index),
-                                local_addr,
-                                current: None,
-                            })
-                        }
+                        State::Resolving(
+                            oneshot::spawn(work, executor),
+                            Arc::clone(host),
+                            port,
+                            local_addr,
+                            Arc::clone(round_robin_map),
+                        )
                     }
                 }
+                State::Resolving(
+                    ref mut future,
+                    ref host,
+                    port,
+                    local_addr,
+                    ref round_robin_map,
+                ) => match future
+                    .poll()
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?
+                {
+                    Async::NotReady => return Ok(Async::NotReady),
+                    Async::Ready(a_results) => {
+                        let shift_index = *round_robin_map
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .entry(Arc::clone(&host))
+                            .and_modify(|e| *e = e.overflowing_add(1).0)
+                            .or_insert(0);
+
+                        State::Connecting(ConnectingTcp {
+                            addrs: dns::IpAddrs::new(port, a_results, shift_index),
+                            local_addr,
+                            current: None,
+                        })
+                    }
+                },
                 State::Connecting(ref mut c) => {
                     let sock = try_ready!(c.poll(&self.handle));
 
@@ -378,7 +408,7 @@ mod http_connector {
     use super::*;
     // Blocking task to be executed on a thread pool.
     pub struct HttpConnectorBlockingTask {
-        pub(super) work: oneshot::Execute<CAresFuture<AResults>>
+        pub(super) work: oneshot::Execute<CAresFuture<AResults>>,
     }
 
     impl fmt::Debug for HttpConnectorBlockingTask {
@@ -401,9 +431,13 @@ mod http_connector {
 struct HttpConnectExecutor(Arc<Executor<HttpConnectorBlockingTask> + Send + Sync>);
 
 impl Executor<oneshot::Execute<CAresFuture<AResults>>> for HttpConnectExecutor {
-    fn execute(&self, future: oneshot::Execute<CAresFuture<AResults>>) -> Result<(), ExecuteError<oneshot::Execute<CAresFuture<AResults>>>> {
-        self.0.execute(HttpConnectorBlockingTask { work: future })
-        .map_err(|err| ExecuteError::new(err.kind(), err.into_future().work))
+    fn execute(
+        &self,
+        future: oneshot::Execute<CAresFuture<AResults>>,
+    ) -> Result<(), ExecuteError<oneshot::Execute<CAresFuture<AResults>>>> {
+        self.0
+            .execute(HttpConnectorBlockingTask { work: future })
+            .map_err(|err| ExecuteError::new(err.kind(), err.into_future().work))
     }
 }
 

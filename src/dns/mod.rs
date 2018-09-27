@@ -1,9 +1,5 @@
-use std::net::{
-    Ipv4Addr, Ipv6Addr,
-    SocketAddr,
-    SocketAddrV4, SocketAddrV6,
-};
 use c_ares::AResults;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 mod c_ares;
 
@@ -26,9 +22,10 @@ impl IpAddrs {
     fn new_from_ipv4s(port: u16, mut ips: Vec<Ipv4Addr>, offset: usize) -> IpAddrs {
         ips.sort();
 
-        let ips = ips.into_iter().map(|ip| {
-            SocketAddr::V4(SocketAddrV4::new(ip, port))
-        }).collect::<Vec<_>>();
+        let ips = ips
+            .into_iter()
+            .map(|ip| SocketAddr::V4(SocketAddrV4::new(ip, port)))
+            .collect::<Vec<_>>();
 
         IpAddrs {
             ips,
@@ -44,7 +41,7 @@ impl IpAddrs {
                 ips: vec![SocketAddr::V4(addr)],
                 current: 0,
                 offset: 0,
-            })
+            });
         }
 
         if let Ok(addr) = host.parse::<Ipv6Addr>() {
@@ -53,7 +50,7 @@ impl IpAddrs {
                 ips: vec![SocketAddr::V6(addr)],
                 current: 0,
                 offset: 0,
-            })
+            });
         }
 
         None
@@ -91,12 +88,16 @@ mod tests {
 
     #[test]
     fn it_sorts_by_ip() {
-        let mut a = IpAddrs::new_from_ipv4s(999, vec![
-            Ipv4Addr::new(127, 0, 0, 1),
-            Ipv4Addr::new(127, 0, 0, 4),
-            Ipv4Addr::new(127, 0, 0, 3),
-            Ipv4Addr::new(127, 0, 0, 2)
-        ], 0);
+        let mut a = IpAddrs::new_from_ipv4s(
+            999,
+            vec![
+                Ipv4Addr::new(127, 0, 0, 1),
+                Ipv4Addr::new(127, 0, 0, 4),
+                Ipv4Addr::new(127, 0, 0, 3),
+                Ipv4Addr::new(127, 0, 0, 2),
+            ],
+            0,
+        );
 
         assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 1));
         assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 2));
@@ -107,12 +108,16 @@ mod tests {
 
     #[test]
     fn shifted_offsets_work() {
-        let mut a = IpAddrs::new_from_ipv4s(999, vec![
-            Ipv4Addr::new(127, 0, 0, 1),
-            Ipv4Addr::new(127, 0, 0, 4),
-            Ipv4Addr::new(127, 0, 0, 3),
-            Ipv4Addr::new(127, 0, 0, 2)
-        ], 2);
+        let mut a = IpAddrs::new_from_ipv4s(
+            999,
+            vec![
+                Ipv4Addr::new(127, 0, 0, 1),
+                Ipv4Addr::new(127, 0, 0, 4),
+                Ipv4Addr::new(127, 0, 0, 3),
+                Ipv4Addr::new(127, 0, 0, 2),
+            ],
+            2,
+        );
 
         assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 3));
         assert_eq_ip!(a.next(), &Ipv4Addr::new(127, 0, 0, 4));
