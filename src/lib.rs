@@ -8,6 +8,7 @@ extern crate futures;
 #[macro_use]
 extern crate lazy_static;
 
+extern crate antidote;
 extern crate c_ares;
 extern crate c_ares_resolver;
 extern crate futures_cpupool;
@@ -20,6 +21,7 @@ extern crate tokio_tcp;
 
 use c_ares::AResults;
 use c_ares_resolver::CAresFuture;
+use std::net::Ipv4Addr;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -27,9 +29,10 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
+use antidote::{Mutex, RwLock};
 use futures::future::{ExecuteError, Executor};
 use futures::sync::oneshot;
 use futures::{Async, Future, Poll};
@@ -41,9 +44,11 @@ use tokio_reactor::Handle;
 use tokio_tcp::{ConnectFuture, TcpStream};
 
 mod dns;
+mod timed_cache;
 
 use self::dns::GLOBAL_RESOLVER;
 use self::http_connector::HttpConnectorBlockingTask;
+use self::timed_cache::TimedCache;
 
 fn connect(
     addr: &SocketAddr,
@@ -79,6 +84,23 @@ fn connect(
     ))
 }
 
+type ResultCache = TimedCache<Arc<String>, Vec<Ipv4Addr>>;
+struct RoundRobinMap(HashMap<Arc<String>, usize>);
+
+impl RoundRobinMap {
+    fn new() -> RoundRobinMap {
+        RoundRobinMap(HashMap::new())
+    }
+
+    fn get_and_incr(&mut self, host: Arc<String>) -> usize {
+        *self
+            .0
+            .entry(Arc::clone(&host))
+            .and_modify(|e| *e = e.overflowing_add(1).0)
+            .or_insert(0)
+    }
+}
+
 /// A connector for the `http` scheme.
 ///
 /// Performs DNS resolution in a thread pool, and then connects over TCP.
@@ -90,7 +112,8 @@ pub struct HttpConnector {
     keep_alive_timeout: Option<Duration>,
     nodelay: bool,
     local_address: Option<IpAddr>,
-    round_robin_map: Arc<Mutex<HashMap<Arc<String>, usize>>>,
+    round_robin_map: Arc<Mutex<RoundRobinMap>>,
+    result_cache: Arc<RwLock<ResultCache>>,
 }
 
 impl HttpConnector {
@@ -129,7 +152,10 @@ impl HttpConnector {
             keep_alive_timeout: None,
             nodelay: false,
             local_address: None,
-            round_robin_map: Arc::new(Mutex::new(HashMap::new())),
+            round_robin_map: Arc::new(Mutex::new(RoundRobinMap::new())),
+            result_cache: Arc::new(RwLock::new(TimedCache::new(
+                Duration::from_secs(60 * 10), // 10 minutes
+            ))),
         }
     }
 
@@ -223,6 +249,7 @@ impl Connect for HttpConnector {
                 port,
                 self.local_address,
                 Arc::clone(&self.round_robin_map),
+                Arc::clone(&self.result_cache),
             ),
             handle: self.handle.clone(),
             keep_alive_timeout: self.keep_alive_timeout,
@@ -278,14 +305,16 @@ enum State {
         Arc<String>,
         u16,
         Option<IpAddr>,
-        Arc<Mutex<HashMap<Arc<String>, usize>>>,
+        Arc<Mutex<RoundRobinMap>>,
+        Arc<RwLock<ResultCache>>,
     ),
     Resolving(
         oneshot::SpawnHandle<AResults, c_ares::Error>,
         Arc<String>,
         u16,
         Option<IpAddr>,
-        Arc<Mutex<HashMap<Arc<String>, usize>>>,
+        Arc<Mutex<RoundRobinMap>>,
+        Arc<RwLock<ResultCache>>,
     ),
     Connecting(ConnectingTcp),
     Error(Option<io::Error>),
@@ -298,7 +327,14 @@ impl Future for HttpConnecting {
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         loop {
             let state = match self.state {
-                State::Lazy(ref executor, ref host, port, local_addr, ref round_robin_map) => {
+                State::Lazy(
+                    ref executor,
+                    ref host,
+                    port,
+                    local_addr,
+                    ref round_robin_map,
+                    ref result_cache,
+                ) => {
                     // If the host is already an IP addr (v4 or v6),
                     // skip resolving the dns and start connecting right away.
                     if let Some(addrs) = dns::IpAddrs::try_parse(host, port) {
@@ -308,14 +344,25 @@ impl Future for HttpConnecting {
                             current: None,
                         })
                     } else {
-                        let work = GLOBAL_RESOLVER.query_a(host);
-                        State::Resolving(
-                            oneshot::spawn(work, executor),
-                            Arc::clone(host),
-                            port,
-                            local_addr,
-                            Arc::clone(round_robin_map),
-                        )
+                        if let Some(ip_addrs) = result_cache.read().get(host) {
+                            let shift_index =
+                                round_robin_map.lock().get_and_incr(Arc::clone(&host));
+                            State::Connecting(ConnectingTcp {
+                                addrs: dns::IpAddrs::new(port, ip_addrs.clone(), shift_index),
+                                local_addr,
+                                current: None,
+                            })
+                        } else {
+                            let work = GLOBAL_RESOLVER.query_a(host);
+                            State::Resolving(
+                                oneshot::spawn(work, executor),
+                                Arc::clone(host),
+                                port,
+                                local_addr,
+                                Arc::clone(round_robin_map),
+                                Arc::clone(result_cache),
+                            )
+                        }
                     }
                 }
                 State::Resolving(
@@ -324,21 +371,19 @@ impl Future for HttpConnecting {
                     port,
                     local_addr,
                     ref round_robin_map,
+                    ref result_cache,
                 ) => match future
                     .poll()
                     .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?
                 {
                     Async::NotReady => return Ok(Async::NotReady),
                     Async::Ready(a_results) => {
-                        let shift_index = *round_robin_map
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .entry(Arc::clone(&host))
-                            .and_modify(|e| *e = e.overflowing_add(1).0)
-                            .or_insert(0);
+                        let ips = a_results.iter().map(|res| res.ipv4()).collect::<Vec<_>>();
+                        let shift_index = round_robin_map.lock().get_and_incr(Arc::clone(&host));
 
+                        result_cache.write().set(Arc::clone(&host), ips.clone());
                         State::Connecting(ConnectingTcp {
-                            addrs: dns::IpAddrs::new(port, a_results, shift_index),
+                            addrs: dns::IpAddrs::new(port, ips, shift_index),
                             local_addr,
                             current: None,
                         })

@@ -1,4 +1,3 @@
-use c_ares::AResults;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 mod c_ares;
@@ -12,14 +11,7 @@ pub struct IpAddrs {
 }
 
 impl IpAddrs {
-    pub fn new(port: u16, a_results: AResults, offset: usize) -> IpAddrs {
-        // Sort list by ips returned, we need a set ordering for the round-robin
-        // selection of ips to work correctly.
-        let ips = a_results.iter().map(|res| res.ipv4()).collect::<Vec<_>>();
-        IpAddrs::new_from_ipv4s(port, ips, offset)
-    }
-
-    fn new_from_ipv4s(port: u16, mut ips: Vec<Ipv4Addr>, offset: usize) -> IpAddrs {
+    pub fn new(port: u16, mut ips: Vec<Ipv4Addr>, offset: usize) -> IpAddrs {
         ips.sort();
 
         let ips = ips
@@ -88,7 +80,7 @@ mod tests {
 
     #[test]
     fn it_sorts_by_ip() {
-        let mut a = IpAddrs::new_from_ipv4s(
+        let mut a = IpAddrs::new(
             999,
             vec![
                 Ipv4Addr::new(127, 0, 0, 1),
@@ -108,7 +100,7 @@ mod tests {
 
     #[test]
     fn shifted_offsets_work() {
-        let mut a = IpAddrs::new_from_ipv4s(
+        let mut a = IpAddrs::new(
             999,
             vec![
                 Ipv4Addr::new(127, 0, 0, 1),
