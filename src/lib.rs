@@ -153,9 +153,7 @@ impl HttpConnector {
             nodelay: false,
             local_address: None,
             round_robin_map: Arc::new(Mutex::new(RoundRobinMap::new())),
-            result_cache: Arc::new(RwLock::new(TimedCache::new(
-                Duration::from_secs(60 * 10), // 10 minutes
-            ))),
+            result_cache: Arc::new(RwLock::new(TimedCache::new())),
         }
     }
 
@@ -345,6 +343,7 @@ impl Future for HttpConnecting {
                         })
                     } else {
                         if let Some(ip_addrs) = result_cache.read().get(host) {
+                            trace!("ResultCache - got cached ips!");
                             let shift_index =
                                 round_robin_map.lock().get_and_incr(Arc::clone(&host));
                             State::Connecting(ConnectingTcp {
@@ -353,6 +352,7 @@ impl Future for HttpConnecting {
                                 current: None,
                             })
                         } else {
+                            trace!("ResultCache - no cached ips!");
                             let work = GLOBAL_RESOLVER.query_a(host);
                             State::Resolving(
                                 oneshot::spawn(work, executor),
@@ -378,10 +378,15 @@ impl Future for HttpConnecting {
                 {
                     Async::NotReady => return Ok(Async::NotReady),
                     Async::Ready(a_results) => {
-                        let ips = a_results.iter().map(|res| res.ipv4()).collect::<Vec<_>>();
+                        let min_ttl = a_results.iter().map(|res| res.ttl()).min();
+                        let ips = a_results.into_iter().map(|res| res.ipv4()).collect::<Vec<_>>();
                         let shift_index = round_robin_map.lock().get_and_incr(Arc::clone(&host));
 
-                        result_cache.write().set(Arc::clone(&host), ips.clone());
+                        trace!("ResultCache - putting in the cache for {}!", host);
+                        // min_ttl will be None if no ip records were found
+                        if let Some(min_ttl) = min_ttl {
+                            result_cache.write().set(Arc::clone(&host), ips.clone(), Duration::from_secs(min_ttl as u64));
+                        }
                         State::Connecting(ConnectingTcp {
                             addrs: dns::IpAddrs::new(port, ips, shift_index),
                             local_addr,
