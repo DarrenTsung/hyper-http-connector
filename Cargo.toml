@@ -2,6 +2,8 @@
 name = "hyper-http-connector"
 version = "0.1.0"
 authors = ["Darren Tsung <darren@onesignal.com>"]
+description = "Replacement for the default Hyper HttpConnector"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 hyper = "0.12"
